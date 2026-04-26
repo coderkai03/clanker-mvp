@@ -46,6 +46,7 @@ uv run server.py
 
 - MCP endpoint: `http(s)://<host>:<port>/mcp`
 - Healthcheck: `http(s)://<host>:<port>/health` — returns `{ "status": "ok", "queue_size": <int> }`
+- Gmail webhook: `http(s)://<host>:<port><GMAIL_WEBHOOK_PATH>?token=<GMAIL_WEBHOOK_TOKEN>` (POST; only enabled when both env vars are set)
 
 ## MongoDB Atlas setup
 
@@ -92,6 +93,27 @@ Failure modes handled automatically:
 - Session crash mid-task: claim's `lease_expires_at` elapses (default `CLAIM_LEASE_SECONDS=1800`), the task becomes claimable again on the next `get_next_task`.
 - Two sessions racing on the same task: MongoDB `findOneAndUpdate` is atomic, so exactly one wins; the other gets either a different task or `null`.
 - Reading without claiming: `get_pending_tasks` is read-only and safe for dashboards.
+
+## Gmail webhook (Pub/Sub push) setup
+
+Real-time ingestion requires GCP-side configuration (Pub/Sub topic + push subscription) plus the env vars below. See the README/CLAUDE.md for the GCP walkthrough; the MCP server-side requirements are:
+
+```bash
+GMAIL_PUBSUB_TOPIC=projects/<gcp-project-id>/topics/<topic>
+GMAIL_WEBHOOK_TOKEN=<random-shared-secret>
+GMAIL_WEBHOOK_PATH=/gmail/webhook        # default
+GMAIL_WATCH_RENEW_HOURS=24               # default
+```
+
+On startup the server calls `users.watch` against the topic and re-registers it every `GMAIL_WATCH_RENEW_HOURS` (Gmail expires watches after 7 days). If `GMAIL_PUBSUB_TOPIC` is unset, webhook ingestion is disabled and only cron polling runs.
+
+### Operational notes for the Gmail webhook
+
+- **Push endpoint URL**: configure the Pub/Sub push subscription to POST to `https://<host><GMAIL_WEBHOOK_PATH>?token=<GMAIL_WEBHOOK_TOKEN>`. The handler rejects requests with a missing or mismatched token (401).
+- **Pub/Sub IAM**: the service account `gmail-api-push@system.gserviceaccount.com` must have the **Pub/Sub Publisher** role on the topic, otherwise `users.watch` fails.
+- **ngrok / dynamic hosts**: every time the public URL changes (e.g. ngrok restart), update the Pub/Sub push subscription's endpoint to match. The `?token=` query string is part of the configured endpoint, not the request body, so it must be set on the subscription itself.
+- **Retries**: the handler returns `200 {"status":"accepted"}` immediately and runs `_ingest_emails()` in the background, so Pub/Sub will not retry on slow ingests. Errors during ingest are logged but not surfaced to Pub/Sub.
+- **Backup polling**: cron ingest (`INGEST_INTERVAL_HOURS`) keeps running, so missed notifications are eventually picked up via the unread-inbox query.
 
 ## Operational notes
 

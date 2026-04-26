@@ -79,6 +79,26 @@ class GmailClient:
             body={"removeLabelIds": ["UNREAD"]},
         ).execute()
 
+    def start_watch(
+        self,
+        topic_name: str,
+        label_ids: list[str] | None = None,
+    ) -> dict:
+        """Register a Gmail push-notification watch on the user's mailbox.
+
+        Returns the API response containing `historyId` and `expiration`
+        (ms epoch, ~7 days out). Callers must renew before expiration.
+        """
+        body: dict = {
+            "topicName": topic_name,
+            "labelIds": label_ids or ["INBOX"],
+        }
+        return self.service.users().watch(userId="me", body=body).execute()
+
+    def stop_watch(self) -> None:
+        """Cancel any active Gmail push-notification watch for this user."""
+        self.service.users().stop(userId="me").execute()
+
     def send_message(
         self,
         to: str,

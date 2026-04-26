@@ -89,6 +89,12 @@ email_processor.py  Parses raw Gmail message dict → AgentTask dataclass with u
 
 **`AgentTask.handoff_instructions`** — pre-formatted string telling the agent exactly what to do, generated from the task at dump time and stored on the Mongo doc.
 
+### Real-time ingestion (Gmail webhook)
+
+When `GMAIL_PUBSUB_TOPIC` and `GMAIL_WEBHOOK_TOKEN` are set, the server registers a Gmail `users.watch` against a Cloud Pub/Sub topic on startup and exposes a push endpoint at `GMAIL_WEBHOOK_PATH` (default `/gmail/webhook`). Pub/Sub POSTs notifications to `https://<host><GMAIL_WEBHOOK_PATH>?token=<GMAIL_WEBHOOK_TOKEN>`; the handler verifies the shared secret with `hmac.compare_digest`, schedules `_ingest_emails()` in the background, and returns `200` immediately. A scheduled `gmail_watch_renew` job re-registers the watch every `GMAIL_WATCH_RENEW_HOURS` (default 24h) because Gmail watches expire after 7 days.
+
+Cron polling (`INGEST_INTERVAL_HOURS`) keeps running as a backup so missed notifications are eventually picked up. If `GMAIL_PUBSUB_TOPIC` is unset, the watch and webhook are disabled and only cron runs.
+
 ### Task document schema (`tasks` collection)
 
 | Field | Type | Notes |
@@ -134,6 +140,10 @@ To reset auth: delete `token.json`.
 | `MONGODB_DB` | `clanker_mcp` | Database name |
 | `MONGODB_TASKS_COLLECTION` | `tasks` | Collection name |
 | `CLAIM_LEASE_SECONDS` | `1800` | Lease length on a claim before it auto-expires |
+| `GMAIL_PUBSUB_TOPIC` | _(empty)_ | Full topic name `projects/<gcp-project>/topics/<topic>`; empty disables webhook |
+| `GMAIL_WEBHOOK_TOKEN` | _(empty)_ | Shared secret required as `?token=` on the push endpoint |
+| `GMAIL_WEBHOOK_PATH` | `/gmail/webhook` | Path Pub/Sub posts to |
+| `GMAIL_WATCH_RENEW_HOURS` | `24` | Watch renewal cadence (Gmail expires watches after 7 days) |
 
 ## MongoDB Atlas setup
 

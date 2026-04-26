@@ -1,4 +1,8 @@
 import asyncio
+import base64
+import binascii
+import hmac
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -9,8 +13,13 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 from starlette.responses import JSONResponse
 
+from datetime import datetime, timezone
+
 from email_processor import EmailProcessor
+from audit_log import AuditLogger
+from gatekeeper import Gatekeeper
 from gmail_client import GmailClient
+from negotiator import Negotiator
 from task_store import MongoTaskStore
 
 load_dotenv()
@@ -39,19 +48,46 @@ MONGODB_DB = os.getenv("MONGODB_DB", "clanker_mcp")
 MONGODB_TASKS_COLLECTION = os.getenv("MONGODB_TASKS_COLLECTION", "tasks")
 CLAIM_LEASE_SECONDS = int(os.getenv("CLAIM_LEASE_SECONDS", "1800"))
 
+GMAIL_PUBSUB_TOPIC = os.getenv("GMAIL_PUBSUB_TOPIC", "").strip()
+GMAIL_WEBHOOK_TOKEN = os.getenv("GMAIL_WEBHOOK_TOKEN", "").strip()
+GMAIL_WEBHOOK_PATH = os.getenv("GMAIL_WEBHOOK_PATH", "/gmail/webhook").strip() or "/gmail/webhook"
+GMAIL_WATCH_RENEW_HOURS = float(os.getenv("GMAIL_WATCH_RENEW_HOURS", "24"))
+
 if not MONGODB_URI:
     raise RuntimeError(
         "MONGODB_URI is required. Set it in .env or your deployment environment."
     )
 
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+if not ANTHROPIC_API_KEY:
+    raise RuntimeError(
+        "ANTHROPIC_API_KEY is required for triage_inbox and validate_and_negotiate tools."
+    )
+
 gmail = GmailClient()
 processor = EmailProcessor()
+gatekeeper = Gatekeeper()
+negotiator = Negotiator()
 task_store = MongoTaskStore(
     uri=MONGODB_URI,
     db_name=MONGODB_DB,
     collection_name=MONGODB_TASKS_COLLECTION,
     default_lease_seconds=CLAIM_LEASE_SECONDS,
 )
+audit_logger = AuditLogger(task_store.audit_log)
+
+
+def _resolve_project_id(client: dict[str, Any]) -> str | None:
+    """Return the project identifier from known client document shapes."""
+    project_id = client.get("project_id")
+    if isinstance(project_id, str) and project_id.strip():
+        return project_id.strip()
+
+    github_repo = client.get("githubRepo")
+    if isinstance(github_repo, str) and github_repo.strip():
+        return github_repo.strip()
+
+    return None
 
 
 async def _ingest_emails() -> int:
@@ -63,7 +99,18 @@ async def _ingest_emails() -> int:
         task = processor.to_agent_task(msg)
         if task is None or task.email_id in existing_ids:
             continue
-        inserted = await task_store.insert_pending(task)
+        client = await task_store.lookup_client(task.sender_email)
+        if client is None:
+            logger.debug("Skipping email from unregistered sender: %s", task.sender_email)
+            continue
+        project_id = _resolve_project_id(client)
+        if project_id is None:
+            logger.warning(
+                "Skipping email from %s: client has no project_id/githubRepo",
+                task.sender_email,
+            )
+            continue
+        inserted = await task_store.insert_pending(task, project_id=project_id)
         if not inserted:
             continue
         existing_ids.add(task.email_id)
@@ -73,6 +120,21 @@ async def _ingest_emails() -> int:
         size = await task_store.queue_size()
         logger.info(f"Ingested {added} tasks (queue: {size})")
     return added
+
+
+def _start_gmail_watch() -> None:
+    """Start (or refresh) the Gmail users.watch registration. Best-effort."""
+    if not GMAIL_PUBSUB_TOPIC:
+        return
+    try:
+        resp = gmail.start_watch(GMAIL_PUBSUB_TOPIC)
+        logger.info(
+            "Gmail watch active: historyId=%s expiration=%s",
+            resp.get("historyId"),
+            resp.get("expiration"),
+        )
+    except Exception as exc:  # pragma: no cover - network/auth errors
+        logger.warning("Failed to start Gmail watch: %s", exc)
 
 
 @asynccontextmanager
@@ -85,12 +147,29 @@ async def _lifespan(app: FastMCP):
         hours=INGEST_INTERVAL_HOURS,
         id="email_ingest",
     )
+    if GMAIL_PUBSUB_TOPIC:
+        _start_gmail_watch()
+        scheduler.add_job(
+            _start_gmail_watch,
+            "interval",
+            hours=GMAIL_WATCH_RENEW_HOURS,
+            id="gmail_watch_renew",
+        )
+    else:
+        logger.info(
+            "GMAIL_PUBSUB_TOPIC unset; webhook ingestion disabled (cron polling only)"
+        )
     scheduler.start()
     await _ingest_emails()  # Immediate run on startup
     try:
         yield
     finally:
         scheduler.shutdown(wait=False)
+        if GMAIL_PUBSUB_TOPIC:
+            try:
+                gmail.stop_watch()
+            except Exception as exc:  # pragma: no cover
+                logger.debug("gmail.stop_watch on shutdown failed: %s", exc)
         task_store.close()
 
 
@@ -117,6 +196,45 @@ mcp = FastMCP(
 async def healthcheck(_request) -> JSONResponse:
     size = await task_store.queue_size()
     return JSONResponse({"status": "ok", "queue_size": size})
+
+
+@mcp.custom_route(GMAIL_WEBHOOK_PATH, methods=["POST"], include_in_schema=False)
+async def gmail_webhook(request) -> JSONResponse:
+    """Pub/Sub push endpoint for Gmail change notifications.
+
+    Verifies a shared-secret token in the URL query, then schedules an
+    `_ingest_emails()` run in the background. Returns 200 immediately so
+    Pub/Sub does not retry on slow ingests.
+    """
+    if not GMAIL_WEBHOOK_TOKEN:
+        return JSONResponse({"error": "webhook_disabled"}, status_code=503)
+
+    token = request.query_params.get("token", "")
+    if not hmac.compare_digest(token, GMAIL_WEBHOOK_TOKEN):
+        logger.warning("gmail_webhook: rejected request with invalid token")
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    message = payload.get("message", {}) if isinstance(payload, dict) else {}
+    data_b64 = message.get("data", "") if isinstance(message, dict) else ""
+    if data_b64:
+        try:
+            decoded = base64.b64decode(data_b64).decode("utf-8", errors="replace")
+            event = json.loads(decoded)
+            logger.info(
+                "gmail_webhook: event email=%s historyId=%s",
+                event.get("emailAddress"),
+                event.get("historyId"),
+            )
+        except (binascii.Error, ValueError, json.JSONDecodeError) as exc:
+            logger.debug("gmail_webhook: could not decode Pub/Sub data: %s", exc)
+
+    asyncio.create_task(_ingest_emails())
+    return JSONResponse({"status": "accepted"})
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +410,178 @@ async def release_task(email_id: str, worker_id: str) -> dict[str, Any]:
         "worker_id": worker_id,
         "queue_size": queue_size,
     }
+
+
+@mcp.tool()
+async def register_client(email: str, project_id: str) -> dict[str, Any]:
+    """
+    Register or update a client email → project mapping.
+
+    Upserts into the clients collection. After registration, emails from
+    this sender are accepted by triage_inbox and tagged with project_id.
+    Subsequent calls with the same email update the project_id.
+
+    Args:
+        email: Client's email address.
+        project_id: Project identifier to associate with this client.
+
+    Returns:
+        The stored client document: {email, project_id, created_at, updated_at}
+    """
+    doc = await task_store.register_client(email=email, project_id=project_id)
+    logger.info("Registered client %s → project %s", email, project_id)
+    return doc
+
+
+@mcp.tool()
+async def triage_inbox(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Classify messages into Candidate Tasks, enforcing client registration.
+
+    Each item must include "message" (str) and "sender_email" (str).
+    Senders not registered in the clients collection receive
+    status="NOT_REGISTERED" and are skipped by the LLM classifier.
+
+    Pass actionable results to validate_and_negotiate to check for
+    redundancy and conflicts before agents claim work.
+
+    Args:
+        messages: List of {"message": str, "sender_email": str} dicts.
+
+    Returns:
+        One result per input item:
+        - Registered:   {task_id, original_message, sender_email, project_id, classification}
+        - Unregistered: {task_id: null, original_message, sender_email,
+                         status: "NOT_REGISTERED", classification: null}
+    """
+    results: list[dict[str, Any] | None] = [None] * len(messages)
+    registered_indices: list[int] = []
+    registered_texts: list[str] = []
+    client_map: dict[int, dict] = {}
+
+    for i, item in enumerate(messages):
+        sender_email = item.get("sender_email", "")
+        message = item.get("message", "")
+        client = await task_store.lookup_client(sender_email)
+        if client is None:
+            logger.info("triage_inbox: unregistered sender %s", sender_email)
+            results[i] = {
+                "task_id": None,
+                "original_message": message,
+                "sender_email": sender_email,
+                "status": "NOT_REGISTERED",
+                "classification": None,
+            }
+        else:
+            registered_indices.append(i)
+            registered_texts.append(message)
+            client_map[i] = client
+
+    if registered_texts:
+        classified = await gatekeeper.triage(registered_texts)
+        for idx, original_i in enumerate(registered_indices):
+            candidate = classified[idx]
+            candidate["sender_email"] = messages[original_i].get("sender_email", "")
+            candidate_project_id = _resolve_project_id(client_map[original_i])
+            if candidate_project_id is None:
+                logger.warning(
+                    "triage_inbox: registered sender without project_id/githubRepo: %s",
+                    candidate["sender_email"],
+                )
+                candidate_project_id = "unknown_project"
+            candidate["project_id"] = candidate_project_id
+            results[original_i] = candidate
+
+    return [r for r in results if r is not None]
+
+
+@mcp.tool()
+async def validate_and_negotiate(candidate_task: dict[str, Any]) -> dict[str, Any]:
+    """
+    Validate a Candidate Task against the active MongoDB task queue.
+
+    Fetches the 15 most recent pending/in_progress tasks (sliding window),
+    then uses an LLM to assess redundancy, conflicts, and Definition of Ready.
+
+    Every decision is written to the audit_log collection. Major conflicts
+    are also persisted to the escalations collection and return
+    error_code="NEEDS_HUMAN_INTERVENTION".
+
+    If the Anthropic API is unavailable, fails open with
+    definition_of_ready="NEW" and metadata.warning="anthropic_api_unavailable".
+
+    Args:
+        candidate_task: A Candidate Task dict from triage_inbox output.
+
+    Returns:
+        {
+          "task_id": "...",
+          "classification": { "category": "...", "priority": "...", "is_actionable": true },
+          "state_analysis": {
+            "is_redundant": false,
+            "conflicts_with": [],
+            "dependencies": [],
+            "definition_of_ready": "READY|NOT_READY|NEEDS_CLARIFICATION|NEW"
+          },
+          "agent_instructions": { "suggested_files": [], "constraints": [] },
+          "metadata": {
+            "is_blocked": false,
+            "requires_intervention": false,
+            "audit_link": "<mongo_id>"
+          },
+          "error_code": null | "NEEDS_HUMAN_INTERVENTION"
+        }
+    """
+    project_id = candidate_task.get("project_id")
+    existing_tasks = await task_store.list_for_negotiation(project_id=project_id)
+    result = await negotiator.validate(candidate_task, existing_tasks)
+
+    reasoning = result.pop("reasoning", "")
+    state = result.get("state_analysis", {})
+    dor = state.get("definition_of_ready", "")
+    is_redundant = state.get("is_redundant", False)
+    conflicts_with = state.get("conflicts_with", [])
+    is_major_conflict = result.get("error_code") == "NEEDS_HUMAN_INTERVENTION"
+
+    if dor == "NEW":
+        decision_type = "NEW"
+    elif is_major_conflict:
+        decision_type = "CONFLICT"
+    elif is_redundant:
+        decision_type = "REDUNDANT"
+    else:
+        decision_type = dor  # "READY" or "NEEDS_CLARIFICATION"
+
+    audit_link = await audit_logger.record(
+        decision_type=decision_type,
+        task_id=candidate_task.get("task_id", "unknown"),
+        reasoning=reasoning,
+        candidate_message=candidate_task.get("original_message", ""),
+        definition_of_ready=dor,
+        conflicts_with=conflicts_with,
+    )
+
+    if is_major_conflict:
+        await task_store.insert_escalation({
+            "candidate_task_id": candidate_task.get("task_id"),
+            "candidate_message": candidate_task.get("original_message", ""),
+            "conflicts_with": conflicts_with,
+            "conflict_severity": "major",
+            "reasoning": reasoning,
+            "audit_link": audit_link,
+            "created_at": datetime.now(timezone.utc),
+        })
+
+    if "metadata" not in result:
+        result["metadata"] = {
+            "is_blocked": is_major_conflict,
+            "requires_intervention": is_major_conflict,
+            "audit_link": audit_link,
+        }
+    else:
+        result["metadata"]["audit_link"] = audit_link
+
+    return result
 
 
 @mcp.tool()

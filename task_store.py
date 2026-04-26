@@ -30,7 +30,7 @@ def _urgency_rank(urgency: str) -> int:
     return _URGENCY_RANK.get(urgency, 1)
 
 
-def _task_to_doc(task: AgentTask) -> dict[str, Any]:
+def _task_to_doc(task: AgentTask, project_id: str | None = None) -> dict[str, Any]:
     """Project an AgentTask into a Mongo document with coordination fields."""
     now = _now()
     return {
@@ -53,7 +53,13 @@ def _task_to_doc(task: AgentTask) -> dict[str, Any]:
         "lease_expires_at": None,
         "created_at": now,
         "completed_at": None,
+        "project_id": project_id,
         "resolution_note": None,
+        "metadata": {
+            "is_blocked": False,
+            "requires_intervention": False,
+            "audit_link": None,
+        },
     }
 
 
@@ -80,20 +86,28 @@ class MongoTaskStore:
         self._client = AsyncIOMotorClient(uri)
         self._db = self._client[db_name]
         self.tasks: AsyncIOMotorCollection = self._db[collection_name]
+        self.clients: AsyncIOMotorCollection = self._db["clients"]
+        self.escalations: AsyncIOMotorCollection = self._db["escalations"]
+        self.audit_log: AsyncIOMotorCollection = self._db["audit_log"]
         self.default_lease_seconds = default_lease_seconds
 
     async def init_indexes(self) -> None:
         """Create indexes required for atomic claims and idempotent inserts."""
+        await self.clients.create_index("email", unique=True)
         await self.tasks.create_index("email_id", unique=True)
         await self.tasks.create_index(
             [("status", 1), ("urgency_rank", 1), ("received_at", 1)]
         )
         await self.tasks.create_index([("status", 1), ("lease_expires_at", 1)])
+        await self.escalations.create_index("candidate_task_id")
+        await self.escalations.create_index("created_at")
+        await self.audit_log.create_index("task_id")
+        await self.audit_log.create_index("recorded_at")
 
-    async def insert_pending(self, task: AgentTask) -> bool:
+    async def insert_pending(self, task: AgentTask, project_id: str | None = None) -> bool:
         """Insert a new pending task. Returns False if email_id already exists."""
         try:
-            await self.tasks.insert_one(_task_to_doc(task))
+            await self.tasks.insert_one(_task_to_doc(task, project_id=project_id))
             return True
         except Exception as e:
             if "duplicate key" in str(e).lower() or "E11000" in str(e):
@@ -225,6 +239,58 @@ class MongoTaskStore:
         return await self.tasks.count_documents(
             {"status": {"$in": [STATUS_PENDING, STATUS_IN_PROGRESS]}}
         )
+
+    async def list_for_negotiation(self, project_id: str | None = None) -> list[dict[str, Any]]:
+        """Return condensed active tasks for Negotiator LLM context (sliding window).
+
+        Capped at 15 most recent pending/in_progress tasks matching project_id.
+        When project_id is provided, tasks from other projects are excluded —
+        no cross-project comparisons are ever made.
+        """
+        query: dict[str, Any] = {
+            "status": {
+                "$in": [STATUS_PENDING, STATUS_IN_PROGRESS],
+                "$ne": STATUS_COMPLETED,
+            }
+        }
+        if project_id is not None:
+            query["project_id"] = project_id
+        cursor = self.tasks.find(
+            query,
+            {
+                "_id": 0,
+                "email_id": 1,
+                "task_type": 1,
+                "urgency": 1,
+                "subject": 1,
+                "extracted_requirements": 1,
+                "status": 1,
+            },
+        ).sort([("received_at", -1)]).limit(15)
+        return [doc async for doc in cursor]
+
+    async def lookup_client(self, email: str) -> dict[str, Any] | None:
+        """Return the client doc for email, or None if not registered."""
+        return await self.clients.find_one({"email": email}, {"_id": 0})
+
+    async def register_client(self, email: str, project_id: str) -> dict[str, Any]:
+        """Upsert a client email → project_id mapping. Returns the stored doc."""
+        now = _now()
+        doc = await self.clients.find_one_and_update(
+            {"email": email},
+            {
+                "$set": {"email": email, "project_id": project_id, "updated_at": now},
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return {k: v for k, v in doc.items() if k != "_id"}
+
+    async def insert_escalation(self, doc: dict[str, Any]) -> str:
+        """Persist a major-conflict escalation. Returns str(inserted_id)."""
+        result = await self.escalations.insert_one(doc)
+        return str(result.inserted_id)
 
     def close(self) -> None:
         self._client.close()
