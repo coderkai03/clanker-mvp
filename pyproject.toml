@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gmail-agent-bridge"
+version = "0.1.0"
+description = "MCP server that ingests Gmail and hands off client tasks to AI coding agents"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.13.0",
+    "google-api-python-client>=2.168.0",
+    "google-auth-oauthlib>=1.2.2",
+    "google-auth-httplib2>=0.2.0",
+    "apscheduler>=3.10.4",
+    "python-dotenv>=1.1.0",
+]
+
+[project.scripts]
+gmail-agent-bridge = "server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
