@@ -80,8 +80,10 @@ MCP endpoint path defaults to `/mcp` (configurable with `MCP_HTTP_PATH`).
 
 ```
 server.py           FastMCP server, cron scheduler, MCP tools (HTTP + stdio), wires task_store
-task_store.py       MongoTaskStore: atomic claim/release/complete via MongoDB find_one_and_update
-gmail_client.py     Google OAuth flow + Gmail API (fetch unread, mark read, send)
+dispatcher.py       Standalone process: tasks change-stream watcher + Devin session spawner
+devin_client.py     Async wrapper around POST {DEVIN_API_URL}/sessions
+task_store.py       MongoTaskStore: atomic claim/release/complete + worker-lock + resume-token helpers
+gmail_client.py     Google OAuth flow + Gmail API (fetch unread, mark read, send, users.watch)
 email_processor.py  Parses raw Gmail message dict → AgentTask dataclass with urgency/type classification
 ```
 
@@ -94,6 +96,28 @@ email_processor.py  Parses raw Gmail message dict → AgentTask dataclass with u
 When `GMAIL_PUBSUB_TOPIC` and `GMAIL_WEBHOOK_TOKEN` are set, the server registers a Gmail `users.watch` against a Cloud Pub/Sub topic on startup and exposes a push endpoint at `GMAIL_WEBHOOK_PATH` (default `/gmail/webhook`). Pub/Sub POSTs notifications to `https://<host><GMAIL_WEBHOOK_PATH>?token=<GMAIL_WEBHOOK_TOKEN>`; the handler verifies the shared secret with `hmac.compare_digest`, schedules `_ingest_emails()` in the background, and returns `200` immediately. A scheduled `gmail_watch_renew` job re-registers the watch every `GMAIL_WATCH_RENEW_HOURS` (default 24h) because Gmail watches expire after 7 days.
 
 Cron polling (`INGEST_INTERVAL_HOURS`) keeps running as a backup so missed notifications are eventually picked up. If `GMAIL_PUBSUB_TOPIC` is unset, the watch and webhook are disabled and only cron runs.
+
+### Dispatcher / Devin orchestration
+
+`dispatcher.py` is a separate long-running process that turns new pending tasks into running Devin sessions in near-real-time. It connects to the same MongoDB Atlas database as the MCP server and uses two helper collections:
+
+- `worker_sessions` — one doc per `project_id` with `status` ("active" | "released") and `lease_expires_at`. Acts as an atomic per-project lock so duplicate change-stream events never spawn two workers for the same project.
+- `dispatcher_state` — single doc storing the latest change-stream resume token so restarts don't lose or duplicate spawns.
+
+```
+1. Email -> _ingest_emails() -> tasks insert (status=pending, project_id)
+2. dispatcher.py change-stream sees the insert
+3. dispatcher.try_acquire_worker_lock(project_id) -- atomic
+4. If acquired: dispatcher calls Devin API to create a session with a worker prompt
+5. Devin session loops get_next_task -> work -> mark_task_complete via the MCP /mcp endpoint
+6. Reconcile loop (RECONCILE_INTERVAL_SECONDS) heals any pending projects missed during downtime
+```
+
+The worker prompt (built in `dispatcher.build_worker_prompt`) tells the Devin session its `worker_id`, `project_id`, and the public MCP URL (`MCP_PUBLIC_URL`).
+
+Dispatcher env vars: `DEVIN_API_KEY`, `DEVIN_API_URL`, `MCP_PUBLIC_URL`, `WORKER_LEASE_SECONDS`, `RECONCILE_INTERVAL_SECONDS`.
+
+Run alongside the MCP server: `uv run dispatcher.py`.
 
 ### Task document schema (`tasks` collection)
 
@@ -144,6 +168,11 @@ To reset auth: delete `token.json`.
 | `GMAIL_WEBHOOK_TOKEN` | _(empty)_ | Shared secret required as `?token=` on the push endpoint |
 | `GMAIL_WEBHOOK_PATH` | `/gmail/webhook` | Path Pub/Sub posts to |
 | `GMAIL_WATCH_RENEW_HOURS` | `24` | Watch renewal cadence (Gmail expires watches after 7 days) |
+| `DEVIN_API_KEY` | _(required for dispatcher)_ | Bearer token for `POST {DEVIN_API_URL}/sessions` |
+| `DEVIN_API_URL` | `https://api.devin.ai/v1` | Devin API base URL |
+| `MCP_PUBLIC_URL` | _(required for dispatcher)_ | Public URL Devin sessions hit (e.g. `https://<host>/mcp`) |
+| `WORKER_LEASE_SECONDS` | `1800` | Per-project lock lease length |
+| `RECONCILE_INTERVAL_SECONDS` | `60` | Dispatcher reconciliation loop period |
 
 ## MongoDB Atlas setup
 

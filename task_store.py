@@ -89,6 +89,8 @@ class MongoTaskStore:
         self.clients: AsyncIOMotorCollection = self._db["clients"]
         self.escalations: AsyncIOMotorCollection = self._db["escalations"]
         self.audit_log: AsyncIOMotorCollection = self._db["audit_log"]
+        self.worker_sessions: AsyncIOMotorCollection = self._db["worker_sessions"]
+        self.dispatcher_state: AsyncIOMotorCollection = self._db["dispatcher_state"]
         self.default_lease_seconds = default_lease_seconds
 
     async def init_indexes(self) -> None:
@@ -103,6 +105,8 @@ class MongoTaskStore:
         await self.escalations.create_index("created_at")
         await self.audit_log.create_index("task_id")
         await self.audit_log.create_index("recorded_at")
+        await self.worker_sessions.create_index("project_id", unique=True)
+        await self.worker_sessions.create_index([("status", 1), ("lease_expires_at", 1)])
 
     async def insert_pending(self, task: AgentTask, project_id: str | None = None) -> bool:
         """Insert a new pending task. Returns False if email_id already exists."""
@@ -291,6 +295,80 @@ class MongoTaskStore:
         """Persist a major-conflict escalation. Returns str(inserted_id)."""
         result = await self.escalations.insert_one(doc)
         return str(result.inserted_id)
+
+    # -- Dispatcher helpers ---------------------------------------------------
+
+    async def get_resume_token(self) -> dict[str, Any] | None:
+        """Return the latest persisted change-stream resume token, or None."""
+        doc = await self.dispatcher_state.find_one({"_id": "tasks_resume_token"})
+        if not doc:
+            return None
+        token = doc.get("token")
+        return token if isinstance(token, dict) else None
+
+    async def save_resume_token(self, token: dict[str, Any]) -> None:
+        """Persist the latest change-stream resume token (upsert)."""
+        await self.dispatcher_state.update_one(
+            {"_id": "tasks_resume_token"},
+            {"$set": {"token": token, "updated_at": _now()}},
+            upsert=True,
+        )
+
+    async def try_acquire_worker_lock(
+        self,
+        project_id: str,
+        session_id: str,
+        lease_seconds: int,
+    ) -> bool:
+        """Atomically acquire a per-project worker lock. Returns False if held."""
+        now = _now()
+        expires = now + timedelta(seconds=lease_seconds)
+        free_filter = {
+            "project_id": project_id,
+            "$or": [
+                {"status": {"$ne": "active"}},
+                {"lease_expires_at": {"$lte": now}},
+                {"lease_expires_at": None},
+            ],
+        }
+        try:
+            result = await self.worker_sessions.update_one(
+                free_filter,
+                {
+                    "$set": {
+                        "project_id": project_id,
+                        "devin_session_id": session_id,
+                        "status": "active",
+                        "lease_expires_at": expires,
+                        "updated_at": now,
+                    },
+                    "$setOnInsert": {"created_at": now},
+                },
+                upsert=True,
+            )
+        except Exception as e:
+            if "duplicate key" in str(e).lower() or "E11000" in str(e):
+                return False
+            raise
+        return bool(result.upserted_id) or result.modified_count > 0
+
+    async def release_worker_lock(self, project_id: str) -> None:
+        """Release the worker lock so the project becomes spawnable again."""
+        await self.worker_sessions.update_one(
+            {"project_id": project_id},
+            {
+                "$set": {
+                    "status": "released",
+                    "lease_expires_at": None,
+                    "updated_at": _now(),
+                }
+            },
+        )
+
+    async def list_pending_project_ids(self) -> list[str]:
+        """Distinct project_ids that currently have at least one pending task."""
+        ids = await self.tasks.distinct("project_id", {"status": STATUS_PENDING})
+        return [pid for pid in ids if isinstance(pid, str) and pid]
 
     def close(self) -> None:
         self._client.close()

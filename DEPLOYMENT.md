@@ -115,6 +115,36 @@ On startup the server calls `users.watch` against the topic and re-registers it 
 - **Retries**: the handler returns `200 {"status":"accepted"}` immediately and runs `_ingest_emails()` in the background, so Pub/Sub will not retry on slow ingests. Errors during ingest are logged but not surfaced to Pub/Sub.
 - **Backup polling**: cron ingest (`INGEST_INTERVAL_HOURS`) keeps running, so missed notifications are eventually picked up via the unread-inbox query.
 
+## Run the dispatcher (Devin worker spawning)
+
+`dispatcher.py` is a second long-running process that watches the `tasks` collection via a Mongo change stream and spawns one Devin session per project that has pending work. It must run alongside the MCP server.
+
+Required env vars (in addition to the MCP server vars):
+
+```bash
+DEVIN_API_KEY=<bearer token from Devin>
+DEVIN_API_URL=https://api.devin.ai/v1                # default
+MCP_PUBLIC_URL=https://<your-public-host>/mcp        # used in worker prompts
+WORKER_LEASE_SECONDS=1800                            # per-project lock TTL
+RECONCILE_INTERVAL_SECONDS=60                        # heal missed events
+```
+
+Run it:
+
+```bash
+uv run dispatcher.py
+```
+
+For local end-to-end testing the typical layout is three terminals: `server.py`, `dispatcher.py`, and `ngrok http 8000`. In production, run them as two separate services (e.g. two systemd units or two containers) sharing the same `.env` and pointing at the same Atlas cluster.
+
+### Operational notes for the dispatcher
+
+- **Only one dispatcher**: run a single dispatcher instance per Mongo cluster. Multiple dispatchers will not spawn duplicate workers (the per-project lock is atomic), but they will both consume the change stream and waste API calls.
+- **Mongo Atlas required**: change streams need a replica set. Atlas always provides one; standalone Mongo deployments must be configured as a single-node replica set.
+- **Idempotent spawns**: every spawn acquires `worker_sessions.{project_id}` with a TTL. Locks auto-expire after `WORKER_LEASE_SECONDS`, so a crashed Devin session does not block the project forever.
+- **Resume tokens**: persisted in `dispatcher_state` after every event so restarts pick up where they left off. If the resume token ages past Mongo's oplog window, the dispatcher logs an error and the reconciliation loop catches up by scanning for `pending` tasks.
+- **Cost control**: lower `WORKER_LEASE_SECONDS` to release locks faster, or raise `RECONCILE_INTERVAL_SECONDS` to reduce reconcile-driven spawns.
+
 ## Operational notes
 
 - Run a single MCP server instance against the Atlas cluster. Replicas are fine for tool reads but the cron ingest should only fire on one node — otherwise the same email gets ingested multiple times before the unique-index dedupes.
